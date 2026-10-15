@@ -195,6 +195,24 @@ void prof__end(void);
 #define PROF_TLS _Thread_local
 #endif
 
+/* Portable atomics. MSVC has no __atomic_* builtins; use the Interlocked
+ * intrinsics instead (full barriers, which are at least as strong as the
+ * acquire/release/relaxed orderings requested at the call sites). */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define PROF_ATOMIC_EXCHANGE32(p, v)  ((i32)_InterlockedExchange((volatile long *)(p), (long)(v)))
+#define PROF_ATOMIC_STORE32(p, v)     ((void)_InterlockedExchange((volatile long *)(p), (long)(v)))
+#define PROF_ATOMIC_LOAD32(p)         ((i32)_InterlockedCompareExchange((volatile long *)(p), 0, 0))
+#define PROF_ATOMIC_FETCH_ADD64(p, v) ((u64)_InterlockedExchangeAdd64((volatile long long *)(p), (long long)(v)))
+#define PROF_ATOMIC_LOAD64(p)         ((u64)_InterlockedCompareExchange64((volatile long long *)(p), 0, 0))
+#else
+#define PROF_ATOMIC_EXCHANGE32(p, v)  (__atomic_exchange_n((p), (v), __ATOMIC_ACQUIRE))
+#define PROF_ATOMIC_STORE32(p, v)     (__atomic_store_n((p), (v), __ATOMIC_RELEASE))
+#define PROF_ATOMIC_LOAD32(p)         (__atomic_load_n((p), __ATOMIC_ACQUIRE))
+#define PROF_ATOMIC_FETCH_ADD64(p, v) (__atomic_fetch_add((p), (v), __ATOMIC_RELAXED))
+#define PROF_ATOMIC_LOAD64(p)         (__atomic_load_n((p), __ATOMIC_RELAXED))
+#endif
+
 #if defined(_WIN32) || defined(_WIN64)
 
 #if defined(_MSC_VER)
@@ -354,11 +372,11 @@ static u8         prof__default_arena[PROF_ARENA_BYTES];
 static PROF_TLS ProfThread *prof__tls_thread;
 
 static void prof__lock(void) {
-    while (__atomic_exchange_n(&prof__state.lock, 1, __ATOMIC_ACQUIRE)) { }
+    while (PROF_ATOMIC_EXCHANGE32(&prof__state.lock, 1)) { }
 }
 
 static void prof__unlock(void) {
-    __atomic_store_n(&prof__state.lock, 0, __ATOMIC_RELEASE);
+    PROF_ATOMIC_STORE32(&prof__state.lock, 0);
 }
 
 static u64 prof__hash(const char *s, const char *file, u32 line) {
@@ -380,7 +398,7 @@ static b32 prof__streq(const char *a, const char *b) {
 }
 
 static void prof__ensure_init(void) {
-    if (__atomic_load_n(&prof__state.initialized, __ATOMIC_ACQUIRE)) return;
+    if (PROF_ATOMIC_LOAD32(&prof__state.initialized)) return;
     prof__lock();
     if (!prof__state.initialized) {
         prof__state.arena      = prof__default_arena;
@@ -388,7 +406,7 @@ static void prof__ensure_init(void) {
         prof__state.events     = (ProfEvent *)prof__state.arena;
         prof__state.event_cap  = prof__state.arena_size / (u64)sizeof(ProfEvent);
         prof__state.record_events = true;
-        __atomic_store_n(&prof__state.initialized, true, __ATOMIC_RELEASE);
+        PROF_ATOMIC_STORE32(&prof__state.initialized, true);
     }
     prof__unlock();
 }
@@ -400,7 +418,7 @@ static ProfZone *prof__get_zone(const char *name, const char *file, u32 line) {
 
     /* Lock-free read of already published entries. */
     for (;;) {
-        u32 slot = __atomic_load_n(&prof__state.zone_slots[i], __ATOMIC_ACQUIRE);
+        u32 slot = (u32)PROF_ATOMIC_LOAD32(&prof__state.zone_slots[i]);
         ProfZone *z;
         if (slot == 0) break;
         z = &prof__state.zones[slot - 1];
@@ -439,14 +457,14 @@ static ProfZone *prof__get_zone(const char *name, const char *file, u32 line) {
         z->self_ns = 0;
         z->incl_ns = 0;
         z->hits    = 0;
-        __atomic_store_n(&prof__state.zone_slots[i], idx + 1, __ATOMIC_RELEASE);
+        PROF_ATOMIC_STORE32(&prof__state.zone_slots[i], (i32)(idx + 1));
         prof__unlock();
         return z;
     }
 }
 
 static void prof__push_event(u64 ts, u32 zone_id, u32 tid, u8 phase) {
-    u64 i = __atomic_fetch_add(&prof__state.event_count, 1, __ATOMIC_RELAXED);
+    u64 i = PROF_ATOMIC_FETCH_ADD64(&prof__state.event_count, 1);
     if (i < prof__state.event_cap) {
         ProfEvent *e = &prof__state.events[i];
         e->ts = ts;
@@ -454,7 +472,7 @@ static void prof__push_event(u64 ts, u32 zone_id, u32 tid, u8 phase) {
         e->tid = tid;
         e->phase = phase;
     } else {
-        __atomic_fetch_add(&prof__state.event_dropped, 1, __ATOMIC_RELAXED);
+        PROF_ATOMIC_FETCH_ADD64(&prof__state.event_dropped, 1);
     }
 }
 
@@ -529,14 +547,14 @@ void prof__end(void) {
     child  = t->child_ns[t->depth];
     elapsed = now - t->start_ns[t->depth];
 
-    __atomic_fetch_add(&z->incl_ns, elapsed, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&z->self_ns, elapsed - child, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&z->hits, 1, __ATOMIC_RELAXED);
+    PROF_ATOMIC_FETCH_ADD64(&z->incl_ns, elapsed);
+    PROF_ATOMIC_FETCH_ADD64(&z->self_ns, elapsed - child);
+    PROF_ATOMIC_FETCH_ADD64(&z->hits, 1);
 
     if (t->depth > 0) {
         t->child_ns[t->depth - 1] += elapsed;
     } else {
-        __atomic_fetch_add(&prof__state.total_ns, elapsed, __ATOMIC_RELAXED);
+        PROF_ATOMIC_FETCH_ADD64(&prof__state.total_ns, elapsed);
     }
 
     if (prof__state.record_events) prof__push_event(now, z->id, t->tid, 1);
@@ -558,7 +576,7 @@ b32 prof_init(void *memory, usize size) {
 
 void prof_frame_end(void) {
     prof__ensure_init();
-    __atomic_fetch_add(&prof__state.frames, 1, __ATOMIC_RELAXED);
+    PROF_ATOMIC_FETCH_ADD64(&prof__state.frames, 1);
 }
 
 void prof_reset(void) {
@@ -582,9 +600,9 @@ void prof_set_recording(b32 enabled) {
     prof__state.record_events = enabled ? true : false;
 }
 
-u64 prof_frame_count(void)   { prof__ensure_init(); return __atomic_load_n(&prof__state.frames, __ATOMIC_RELAXED); }
-u64 prof_event_count(void)   { prof__ensure_init(); return __atomic_load_n(&prof__state.event_count, __ATOMIC_RELAXED); }
-u64 prof_event_dropped(void) { prof__ensure_init(); return __atomic_load_n(&prof__state.event_dropped, __ATOMIC_RELAXED); }
+u64 prof_frame_count(void)   { prof__ensure_init(); return PROF_ATOMIC_LOAD64(&prof__state.frames); }
+u64 prof_event_count(void)   { prof__ensure_init(); return PROF_ATOMIC_LOAD64(&prof__state.event_count); }
+u64 prof_event_dropped(void) { prof__ensure_init(); return PROF_ATOMIC_LOAD64(&prof__state.event_dropped); }
 
 typedef struct {
     i64 fd;
@@ -794,7 +812,7 @@ b32 prof_write_trace(const char *path) {
     prof__w_cstr(&w, "}}");
     first = false;
 
-    n = __atomic_load_n(&prof__state.event_count, __ATOMIC_RELAXED);
+    n = PROF_ATOMIC_LOAD64(&prof__state.event_count);
     if (n > prof__state.event_cap) n = prof__state.event_cap;
 
     for (i = 0; i < n; i++) {
