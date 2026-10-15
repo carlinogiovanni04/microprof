@@ -1,0 +1,7 @@
+bin/
+*.json
+
+*.exe
+*.pdb
+
+.clangd
