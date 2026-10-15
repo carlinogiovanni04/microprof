@@ -199,6 +199,7 @@ void prof__end(void);
  * intrinsics instead (full barriers, which are at least as strong as the
  * acquire/release/relaxed orderings requested at the call sites). */
 #if defined(_MSC_VER)
+#pragma warning(disable : 4456) // NOTE(Giovanni): "se si dichiara 'prof__scope_once_', la dichiarazione locale precedente verrà nascosta"
 #include <intrin.h>
 #define PROF_ATOMIC_EXCHANGE32(p, v)  ((i32)_InterlockedExchange((volatile long *)(p), (long)(v)))
 #define PROF_ATOMIC_STORE32(p, v)     ((void)_InterlockedExchange((volatile long *)(p), (long)(v)))
