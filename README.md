@@ -7,8 +7,6 @@ Chrome Trace JSON you can open in `chrome://tracing` or [Perfetto](https://ui.pe
 
 - No libc: Linux uses raw syscalls, Windows uses direct kernel32 imports.
 - No allocation: fixed static arena (or hand in your own memory).
-- Self-contained: defines the `i8..u64`/`b32` aliases itself, or defers to
-  `base.h` if that was included first.
 
 ## Including it
 
